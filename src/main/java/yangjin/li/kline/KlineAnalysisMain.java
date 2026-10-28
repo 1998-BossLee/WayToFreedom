@@ -39,11 +39,11 @@ public final class KlineAnalysisMain {
             .callTimeout(20, TimeUnit.SECONDS)
             .build();
 
-    /** 绝对趋平上限：一根 K 线间的 MA5 变化率绝对值最多为 0.05%。数值单位是百分比/根。 */
-    public static final BigDecimal FLAT_THRESHOLD_PCT = new BigDecimal("0.05");
-
-    /** 相对减速比例：当前移动速度的绝对值最多为前 3 根典型移动速度的 30%，即至少减速 70%。 */
-    public static final BigDecimal SLOWDOWN_RATIO = new BigDecimal("0.30");
+    /**
+     * 手动调节减速百分比：70 表示 MA5 速度相对前三根中位数至少降低 70%（只剩 30%）。
+     * 改成 60 更宽松，改成 80 更严格；取值 (0,100]。不再使用固定的 0.05% 上限。
+     */
+    public static final BigDecimal DECELERATION_THRESHOLD_PCT = new BigDecimal("70");
 
     /** 从候选低点反弹/候选高点下跌达到 2%，才确认一轮有效行情。 */
     public static final BigDecimal MIN_TREND_MOVE_PCT = new BigDecimal("2.0");
@@ -61,27 +61,52 @@ public final class KlineAnalysisMain {
     private KlineAnalysisMain() {
     }
 
+    /** 手动测试参数；开始/结束时间格式 yyyy-MM-dd HH:mm，均为北京时间的开盘时间，首尾包含。 */
+    public record AnalysisRequest(String symbol, String startTime, String endTime, String interval) {
+    }
+
     public static void main(String[] args) throws IOException, InterruptedException {
-        if (args.length != 0 && args.length != 4) {
-            throw new IllegalArgumentException("参数：币种 周期 '开始时间' '结束时间'，时间格式 yyyy-MM-dd HH:mm");
+        AnalysisRequest request = args.length == 0 ? new AnalysisRequest(ContractSymbol.ETH_USDT, "2026-10-18 00:00", "2026-10-23 07:00", KlineInterval.HOUR_1) : parseArguments(args);
+       // testAnalysis(request);
+        request = new AnalysisRequest(ContractSymbol.ZEC_USDT, "2026-08-15 00:00", "2026-10-27 00:00", KlineInterval.DAY_1);
+        testAnalysis(request);
+    }
+
+    /**
+     * 手动测试入口：自动补取均线预热数据、拉取 OKX 合约 K 线并打印分析结果。
+     * main 中只需一行定义 AnalysisRequest，一行调用本方法。
+     * 这是普通静态调试方法，直接运行 main 即可，不依赖 JUnit。
+     */
+    public static void testAnalysis(AnalysisRequest request) throws IOException, InterruptedException {
+        if (request == null) {
+            throw new IllegalArgumentException("分析参数不能为空");
         }
-        String symbol = args.length == 0 ? ContractSymbol.ETH_USDT : args[0];
-        String interval = args.length == 0 ? KlineInterval.HOUR_1 : args[1];
-        LocalDateTime start = LocalDateTime.parse(args.length == 0 ? "2026-10-18 00:00" : args[2], TIME);
-        LocalDateTime end = LocalDateTime.parse(args.length == 0 ? "2026-10-23 07:00" : args[3], TIME);
+        String symbol = request.symbol();
+        String interval = request.interval();
+        LocalDateTime start = LocalDateTime.parse(request.startTime(), TIME);
+        LocalDateTime end = LocalDateTime.parse(request.endTime(), TIME);
         if (start.isAfter(end)) {
             throw new IllegalArgumentException("开始时间不能晚于结束时间");
         }
 
-        // fetchKlines 只返回传入范围；main 多取 10 根，用于均线和交叉状态预热。
+        // fetchKlines 只返回传入范围；调试入口多取 10 根，用于均线和交叉状态预热。
         Bar bar = Bar.parse(interval);
         LocalDateTime warmupStart = bar.shift(start, -WARMUP_BARS);
         System.out.printf("即时读取 %s %s，北京时间 %s 至 %s（按开盘时间，首尾包含）%n",
                 normalizeSymbol(symbol), bar.apiValue(), start.format(TIME), end.format(TIME));
-        System.out.printf("行情规则：从起点走出 %s 确认启动；回吐本轮幅度 %s 时结束；均线交叉不重置起点。%n",
+        System.out.printf("行情规则：上涨、下跌独立从各自起点走出 %s 确认；各自回吐本轮幅度 %s 时结束；均线交叉不重置起点。%n",
                 percent(MIN_TREND_MOVE_PCT), percent(TREND_RETRACE_RATIO.multiply(HUNDRED)));
+        System.out.printf("趋平规则：MA5 速度相对前三根中位数至少降低 %s。%n", percent(DECELERATION_THRESHOLD_PCT));
         List<Kline> klines = fetchKlines(symbol, interval, warmupStart, end);
-        analyze(klines, start, FLAT_THRESHOLD_PCT, SLOWDOWN_RATIO);
+        analyze(klines, start, DECELERATION_THRESHOLD_PCT);
+    }
+
+    /** 保留命令行调用方式，顺序仍为：币种、周期、开始时间、结束时间。 */
+    private static AnalysisRequest parseArguments(String[] args) {
+        if (args.length != 4) {
+            throw new IllegalArgumentException("参数：币种 周期 '开始时间' '结束时间'，时间格式 yyyy-MM-dd HH:mm");
+        }
+        return new AnalysisRequest(args[0], args[2], args[3], args[1]);
     }
 
     /** 输入北京时间的 K 线开盘范围，首尾包含；返回该范围内去重、正序的原始数据。 */
@@ -214,19 +239,19 @@ public final class KlineAnalysisMain {
 
     /** 逐根打印指标；金叉、死叉、上涨趋平和下跌趋平均会单独打印提醒。 */
     public static void analyze(List<Kline> klines) {
-        analyze(klines, LocalDateTime.MIN, FLAT_THRESHOLD_PCT, SLOWDOWN_RATIO);
+        analyze(klines, LocalDateTime.MIN, DECELERATION_THRESHOLD_PCT);
     }
 
     /** 使用默认行情分段参数：2% 确认启动，回吐本轮幅度 50% 时结束。 */
     public static void analyze(List<Kline> klines, LocalDateTime displayFrom,
-                               BigDecimal flatThresholdPct, BigDecimal slowdownRatio) {
-        analyze(klines, displayFrom, flatThresholdPct, slowdownRatio, MIN_TREND_MOVE_PCT, TREND_RETRACE_RATIO);
+                               BigDecimal decelerationThresholdPct) {
+        analyze(klines, displayFrom, decelerationThresholdPct, MIN_TREND_MOVE_PCT, TREND_RETRACE_RATIO);
     }
 
     /** minimumTrendMovePct = 0 可暂时关闭行情过滤，单独检查原来的几何趋平算法。 */
     public static void analyze(List<Kline> klines, LocalDateTime displayFrom,
-                               BigDecimal flatThresholdPct, BigDecimal slowdownRatio, BigDecimal minimumTrendMovePct) {
-        analyze(klines, displayFrom, flatThresholdPct, slowdownRatio, minimumTrendMovePct, TREND_RETRACE_RATIO);
+                               BigDecimal decelerationThresholdPct, BigDecimal minimumTrendMovePct) {
+        analyze(klines, displayFrom, decelerationThresholdPct, minimumTrendMovePct, TREND_RETRACE_RATIO);
     }
 
     /**
@@ -237,23 +262,25 @@ public final class KlineAnalysisMain {
      * s[t] = (MA5[t] - MA5[t-1]) / MA5[t-1] * 100
      * 前三根 s 全正 -> 上涨趋平；全负 -> 下跌趋平；混合、零或不足则不新进入。
      * B = 前三根 |s| 的中位数
-     * 几何趋平 = |s[t]| <= min(flatThresholdPct, B * slowdownRatio)
+     * 减速百分比 = (1 - |s[t]| / B) * 100
+     * 几何趋平 = 减速百分比 >= decelerationThresholdPct
+     * 等价阈值：|s[t]| <= B * (1 - decelerationThresholdPct / 100)
      * </pre>
-     * 进入后固定该段方向、B 和阈值，直到离开阈值或对应行情段结束。
+     * 进入后固定该段方向、B 和阈值，直到离开阈值或同方向行情段结束；另一方向结束不影响本段。
      * 小幅正负切换仍为延续，不重复提醒；同段第一次满足行情过滤条件才提醒。
      *
-     * <p>默认先从候选收盘低点/高点走出 2%，确认上涨/下跌段，起点保留在过去的极值处，
+     * <p>上涨与下跌独立从各自候选收盘低点/高点走出 2% 后确认，允许同时有效，起点保留在过去的极值处，
      * 确认时间记录在当前 K 线结束时。金叉、死叉不改变这一段的起点或极值。
      * 上涨段从最高收盘价回吐累计涨幅的 50% 才结束；下跌段从最低收盘价反弹收复累计跌幅的 50% 才结束。
      * 计算详见 TrendLegTracker，全部基于收盘价而非盘中最高/最低价。</p>
      *
-     * <p>上涨趋平需要当前为已确认上涨段，下跌趋平需要当前为已确认下跌段。
+     * <p>上涨趋平查询上涨区域，下跌趋平查询下跌区域；两者可同时有效，另一方向不阻断。
      * 不再要求当前价格相对最新金叉/死叉交点走出 2%，也不在回撤后重复检查当前段涨幅是否仍 >= 2%；
      * 启动时已经确认有效推进，之后由 50% 回吐条件管理该段是否结束。
      * minimumTrendMovePct = 0 关闭行情过滤，行情观察本身仍按默认 2% 计算，方便隔离调试几何条件。</p>
      *
      * <p>金叉和死叉仍各自单独提醒，均线位置不作为过滤条件。
-     * 同一根可能结束旧行情、确认新行情，再分别满足交叉与趋平提醒。
+     * 同一根可以结束一个方向、确认另一个方向，再分别满足交叉与趋平提醒。
      * 原始候选编号包含被行情过滤的形态；四类提醒统计只计显示范围内实际打印的提醒。
      * 预热期间已满足完整条件的趋平进入显示范围不补发；预热未满足、后来首次满足时允许提醒。
      * 未确认 K 线重置对应状态，不跨过未知区间猜测行情；本程序只输出控制台。</p>
@@ -261,19 +288,20 @@ public final class KlineAnalysisMain {
      * <p>本版用于手动复盘：尚未单独识别横盘平台、突破或成交量，也没有接入 ATR。
      * 金死叉不重置行情起点，并不等于所有横盘期间的趋平都已被排除。</p>
      *
+     * @param decelerationThresholdPct 减速百分比，取值 (0,100]；70 表示速度至少降低 70%
      * @param minimumTrendMovePct 启动确认幅度，单位百分比；0 仅用于关闭行情过滤
      * @param retraceRatio 结束行情的回吐比例，取值 (0,1]；0.50 表示回吐累计幅度的一半
      */
     public static void analyze(List<Kline> klines, LocalDateTime displayFrom,
-                               BigDecimal flatThresholdPct, BigDecimal slowdownRatio,
+                               BigDecimal decelerationThresholdPct,
                                BigDecimal minimumTrendMovePct, BigDecimal retraceRatio) {
-        if (klines == null || displayFrom == null || flatThresholdPct == null || slowdownRatio == null
-                || flatThresholdPct.signum() <= 0 || slowdownRatio.signum() <= 0
-                || slowdownRatio.compareTo(BigDecimal.ONE) > 0 || minimumTrendMovePct == null
-                || minimumTrendMovePct.signum() < 0 || retraceRatio == null || retraceRatio.signum() <= 0
-                || retraceRatio.compareTo(BigDecimal.ONE) > 0) {
-            throw new IllegalArgumentException("请提供合法阈值：平缓阈值 > 0，收缩比例在 (0,1] 内，启动幅度 >= 0，回吐比例在 (0,1] 内");
+        if (klines == null || displayFrom == null || decelerationThresholdPct == null
+                || decelerationThresholdPct.signum() <= 0 || decelerationThresholdPct.compareTo(HUNDRED) > 0
+                || minimumTrendMovePct == null || minimumTrendMovePct.signum() < 0
+                || retraceRatio == null || retraceRatio.signum() <= 0 || retraceRatio.compareTo(BigDecimal.ONE) > 0) {
+            throw new IllegalArgumentException("请提供合法阈值：减速百分比在 (0,100] 内，启动幅度 >= 0，回吐比例在 (0,1] 内");
         }
+        BigDecimal remainingSpeedRatio = HUNDRED.subtract(decelerationThresholdPct).movePointLeft(2);
         List<Kline> data = new ArrayList<>(klines);
         data.sort(Comparator.comparing(Kline::openTime));
         validateSequence(data);
@@ -304,8 +332,9 @@ public final class KlineAnalysisMain {
             slopes[i] = i == 0 || averages[i] == null || averages[i - 1] == null ? null
                     : changeRate(averages[i], averages[i - 1]);
             boolean visible = !k.openTime().isBefore(displayFrom);
-            if (trendFilterEnabled && trend.completedLeg() != null) {
-                // 行情段结束才终止对应形态，均线金死叉本身不会触发这里的重置。
+            if (trendFilterEnabled && activeFlatDirection != null
+                    && trendForFlat(trend, activeFlatDirection).completedLeg() != null) {
+                // 只在形态同方向的区域结束时清空；另一方向结束和均线交叉不重置本段。
                 activeThreshold = null;
                 activeBaseline = null;
                 activeFlatDirection = null;
@@ -339,7 +368,9 @@ public final class KlineAnalysisMain {
                     if (previouslyRising || previouslyFalling) {
                         // 上涨、下跌统一比较速度大小，基准取三个变化率绝对值的中位数。
                         baseline = median(slopes[i - 3].abs(), slopes[i - 2].abs(), slopes[i - 1].abs());
-                        BigDecimal threshold = flatThresholdPct.min(baseline.multiply(slowdownRatio));
+                        // 基准取当前根之前的三根，当前根不参与；只比较相对减速，不按币种/周期硬设速度上限。
+                        // 用乘法比较边界，避免先除法舍入导致恰好减速 70% 时被漏掉。
+                        BigDecimal threshold = baseline.multiply(remainingSpeedRatio);
                         if (absoluteSlope.compareTo(threshold) <= 0) {
                             activeThreshold = threshold;
                             activeBaseline = baseline;
@@ -398,10 +429,11 @@ public final class KlineAnalysisMain {
                 if (flatReminder) {
                     // 03:00 小时线覆盖 [03:00, 04:00)，所以用其结束时间 04:00 标记可提醒时刻。
                     MaCrossPoint goldenCross = cross.goldenCross();
-                    TrendLegTracker.Leg trendLeg = trend.leg();
+                    TrendLegTracker.DirectionalSnapshot flatTrend = trendForFlat(trend, activeFlatDirection);
+                    TrendLegTracker.Leg trendLeg = flatTrend.leg();
                     System.out.printf(Locale.ROOT,
                             "[提醒] %s %s 候选段 #%d；提醒类型=%s；所属K线=%s；收盘提醒时间=%s；"
-                                    + "收盘价=%s；MA5=%s；变化率=%s；前3根绝对值中位数=%s；本段阈值=%s；"
+                                    + "收盘价=%s；MA5=%s；变化率=%s；前3根绝对值中位数=%s；本段阈值=%s；实际减速比例=%s；减速门槛=%s；"
                                     + "MA10=%s；均线位置=%s；本根交叉=%s；最近金叉所属K线=%s；"
                                     + "金叉确认时间=%s；金叉交点估算值=%s；价格较金叉涨幅=%s；MA5较金叉涨幅=%s；"
                                     + "行情方向=%s；行情段编号=%s；行情起点所属K线=%s；行情起点价=%s；"
@@ -410,6 +442,8 @@ public final class KlineAnalysisMain {
                             k.symbol(), k.interval(), activeCandidateNumber, activeFlatDirection,
                             format(k.openTime()), format(k.closeTime()),
                             number(k.close()), number(averages[i]), percent(slopes[i]), percent(activeBaseline), percent(activeThreshold),
+                            percent(HUNDRED.subtract(slopes[i].abs().divide(activeBaseline, MC).multiply(HUNDRED))),
+                            percent(decelerationThresholdPct),
                             number(ma10), cross.position(), cross.event(),
                             goldenCross == null ? "未知" : format(goldenCross.openTime()),
                             goldenCross == null ? "未知" : format(goldenCross.confirmedTime()),
@@ -422,7 +456,7 @@ public final class KlineAnalysisMain {
                             trendLeg == null ? "未知" : format(trendLeg.confirmedTime()),
                             trendLeg == null ? "未知" : format(trendLeg.extreme().openTime()),
                             trendLeg == null ? "未知" : number(trendLeg.extreme().price()),
-                            gain(trend.movePct()), gain(trend.maximumMovePct()), ratioPercent(trend.retracementRatio()),
+                            gain(flatTrend.movePct()), gain(flatTrend.maximumMovePct()), ratioPercent(flatTrend.retracementRatio()),
                             ratioPercent(retraceRatio));
                 }
             }
@@ -448,27 +482,29 @@ public final class KlineAnalysisMain {
     }
 
     static TrendFlatCheck checkTrendForFlat(TrendLegTracker.Snapshot trend, String flatDirection, boolean enabled) {
-        if (trend == null) {
-            throw new IllegalArgumentException("行情状态不能为空");
-        }
-        String expected;
-        if (MaCrossState.FlatDirection.UP.equals(flatDirection)) {
-            expected = TrendDirection.UP;
-        } else if (MaCrossState.FlatDirection.DOWN.equals(flatDirection)) {
-            expected = TrendDirection.DOWN;
-        } else {
-            throw new IllegalArgumentException("未知趋平方向：" + flatDirection);
-        }
+        TrendLegTracker.DirectionalSnapshot selected = trendForFlat(trend, flatDirection);
         if (!enabled) {
             return new TrendFlatCheck(true, "行情过滤已关闭");
         }
-        if (trend.leg() == null) {
-            return new TrendFlatCheck(false, "行情尚未确认，不提醒");
+        if (selected.leg() == null) {
+            return new TrendFlatCheck(false, flatDirection + "对应方向行情尚未确认，不提醒");
         }
-        if (!expected.equals(trend.leg().direction())) {
-            return new TrendFlatCheck(false, "当前为" + trend.leg().direction() + "行情，与趋平方向不符，不提醒");
+        return new TrendFlatCheck(true, "已确认" + selected.leg().direction() + "行情，行情条件满足");
+    }
+
+    /** 形态方向一旦固定，资格判断、结束事件和提醒字段始终选择同一方向的区域。 */
+    private static TrendLegTracker.DirectionalSnapshot trendForFlat(TrendLegTracker.Snapshot trend,
+                                                                  String flatDirection) {
+        if (trend == null) {
+            throw new IllegalArgumentException("行情状态不能为空");
         }
-        return new TrendFlatCheck(true, "已确认" + expected + "行情，行情条件满足");
+        if (MaCrossState.FlatDirection.UP.equals(flatDirection)) {
+            return trend.up();
+        }
+        if (MaCrossState.FlatDirection.DOWN.equals(flatDirection)) {
+            return trend.down();
+        }
+        throw new IllegalArgumentException("未知趋平方向：" + flatDirection);
     }
 
     private static String ratioPercent(BigDecimal ratio) {

@@ -6,4 +6,5 @@ public interface ContractSymbol {
     String ETH_USDT = "ETH-USDT-SWAP";
     String SOL_USDT = "SOL-USDT-SWAP";
     String BNB_USDT = "BNB-USDT-SWAP";
+    String ZEC_USDT = "ZEC-USDT-SWAP";
 }
